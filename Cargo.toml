@@ -13,17 +13,17 @@ tzdata-bundled = ["jiff/tzdb-bundle-always", "dep:jiff-tzdb"]
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
-ed25519-dalek = "2"
-getrandom = "0.3"
+ed25519-dalek = "3"
+getrandom = "0.4"
 # No bundled database: jiff reads TZif files from a directory at runtime.
-jiff-tzdb = { version = "0.1", optional = true }
-jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-zoneinfo"] }
+jiff-tzdb = { version = "1", optional = true }
+jiff = { version = "1", default-features = false, features = ["std", "tzdb-zoneinfo"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-# native-certs: trust the OS certificate store (works behind corporate proxies)
-ureq = { version = "2", default-features = false, features = ["json", "tls", "native-certs"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.11"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
+hex = "0.4.3"
 
 [profile.release]
 lto = true

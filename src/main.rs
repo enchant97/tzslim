@@ -202,7 +202,7 @@ fn push_line<T: Serialize>(buf: &mut Vec<u8>, value: &T) -> Result<()> {
 // --------------------------------------------------------------------------
 /// Lowercase hex SHA-256 of a raw public key, used as the key id in signatures.
 fn key_id(public_key: &[u8; 32]) -> String {
-    format!("{:x}", Sha256::digest(public_key))
+    hex::encode(Sha256::digest(public_key))
 }
 
 /// An ed25519 signing key together with its id.
@@ -254,7 +254,7 @@ impl Integrity {
             }
         });
         Trailer {
-            hash: format!("{digest:x}"),
+            hash: hex::encode(digest),
             sig,
         }
     }
@@ -300,7 +300,8 @@ fn ensure_database(cache: &Path) -> Result<PathBuf> {
     let meta: PypiMeta = ureq::get(PYPI_URL)
         .call()
         .context("could not reach PyPI (use --tzdata-dir to work offline)")?
-        .into_json()?;
+        .into_body()
+        .read_json()?;
     let file = meta
         .urls
         .iter()
@@ -318,10 +319,11 @@ fn ensure_database(cache: &Path) -> Result<PathBuf> {
     let mut wheel = Vec::new();
     ureq::get(&file.url)
         .call()?
+        .into_body()
         .into_reader()
         .read_to_end(&mut wheel)?;
 
-    let digest = format!("{:x}", Sha256::digest(&wheel));
+    let digest = hex::encode(Sha256::digest(&wheel));
     if !digest.eq_ignore_ascii_case(&file.digests.sha256) {
         bail!("SHA-256 mismatch for {}: got {digest}", file.filename);
     }
@@ -438,7 +440,7 @@ fn build(args: BuildArgs) -> Result<()> {
 
     // Transitions are listed from the creation time up to this many calendar years later.
     let end = created
-        .to_zoned(TimeZone::UTC)
+        .to_zoned_datetime(TimeZone::UTC)
         .checked_add(Span::new().years(i64::from(args.years)))?
         .timestamp()
         .as_second();
