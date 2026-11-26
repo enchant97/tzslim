@@ -14,16 +14,11 @@
 //! {"v":"2026b","n":"Europe/London","a":"GMT","o":0,"u":1924991999}
 //! {"t":1774832400,"o":3600,"a":"BST"}
 //! {"t":1792976400,"o":0,"a":"GMT"}
-//! {"hash":"<base64 sha256 of every byte above>","sig":null}
+//! {"hash":"<base64 sha256 of every byte above>"}
+//! {"alg":"ed25519","val":"<base64 of signature: hash+timestamp>","kid":"<base64 sha256 of public key>","timestamp":1795723895}
 //! ```
-//!
-//! The trailer is always the LAST line. `hash` covers every byte before it,
-//! including the newline ending the last data line. With `--sign`, `sig` is
-//! filled in instead of null:
-//!
-//! ```text
-//! {"hash":"...","sig":{"alg":"ed25519","val":"<base64>","key":"<base64 sha256 of public key>","timestamp":1767225600}}
-//! ```
+//! The integrity trailer is always the LAST line before any signature lines.
+//! `hash` covers every byte before it, including the newline ending the last data line.
 //!
 //! The ed25519 signature is made over the 32 raw bytes of the SHA-256 digest
 //! followed by `timestamp` as an 8-byte big-endian unsigned integer.
