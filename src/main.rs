@@ -109,17 +109,32 @@ struct IndexRow<'a> {
     h: Box<[u8]>,
 }
 
-/// Final line of every file: a hash of everything above it, plus an optional
-/// signature over that hash.
+/// A hash of everything above it.
+///
+/// Goes after tz-data, but before signatures
 #[serde_as]
 #[derive(Serialize)]
-struct Trailer<'a> {
+struct IntegrityTrailer {
     /// SHA-256 of every byte above this line, including the
     /// newline ending the last data line. Always present
     #[serde_as(as = "Base64")]
     hash: Box<[u8]>,
-    /// ed25519 signature, or null when the build was not signed
-    sig: Option<Signature<'a>>,
+}
+
+impl IntegrityTrailer {
+    fn sign(&self, signer: &Signer) -> Signature<'_> {
+        let timestamp: u64 = Timestamp::now().as_second().try_into().unwrap();
+        // Signed message: raw digest bytes, then the timestamp big-endian.
+        let mut msg = Vec::with_capacity(40);
+        msg.extend_from_slice(&self.hash);
+        msg.extend_from_slice(&timestamp.to_be_bytes());
+        Signature {
+            alg: "ed25519",
+            val: Box::new(signer.key.sign(&msg).to_bytes()),
+            key: signer.key_id.clone(),
+            timestamp,
+        }
+    }
 }
 
 /// Signature over `raw SHA-256 digest (32 bytes) || timestamp (8 bytes, big-endian)`.
@@ -167,12 +182,10 @@ struct Signer {
 struct Integrity {
     /// None means files are written with `"sig": null`
     signer: Option<Signer>,
-    /// Creation time (Unix seconds) written into every signature of this run
-    created: u64,
 }
 
 impl Integrity {
-    fn new(key_b64: Option<&str>, created: u64) -> Result<Self> {
+    fn new(key_b64: Option<&str>) -> Result<Self> {
         let signer = key_b64
             .map(|raw| -> Result<Signer> {
                 let bytes = B64
@@ -186,34 +199,25 @@ impl Integrity {
                 Ok(Signer { key, key_id })
             })
             .transpose()?;
-        Ok(Self { signer, created })
+        Ok(Self { signer })
     }
 
-    fn trailer(&self, body: &[u8]) -> Trailer<'_> {
+    fn trailer(&self, body: &[u8]) -> IntegrityTrailer {
         let digest = Sha256::digest(body);
-        let sig = self.signer.as_ref().map(|s| {
-            // Signed message: raw digest bytes, then the timestamp big-endian.
-            let mut msg = Vec::with_capacity(40);
-            msg.extend_from_slice(&digest);
-            msg.extend_from_slice(&self.created.to_be_bytes());
-            Signature {
-                alg: "ed25519",
-                val: Box::new(s.key.sign(&msg).to_bytes()),
-                key: s.key_id.clone(),
-                timestamp: self.created,
-            }
-        });
-        Trailer {
+        IntegrityTrailer {
             hash: digest.to_vec().into_boxed_slice(),
-            sig,
         }
     }
 
     /// Append the trailer as the final NDJSON line (always present).
     /// Returns the finished file bytes and the trailer that was written.
-    fn seal(&self, mut body: Vec<u8>) -> Result<(Vec<u8>, Trailer<'_>)> {
+    fn seal(&self, mut body: Vec<u8>) -> Result<(Vec<u8>, IntegrityTrailer)> {
         let trailer = self.trailer(&body);
         push_line(&mut body, &trailer)?;
+        if let Some(signer) = &self.signer {
+            let signature = trailer.sign(signer);
+            push_line(&mut body, &signature)?;
+        }
         Ok((body, trailer))
     }
 }
@@ -250,7 +254,7 @@ fn build(args: BuildArgs) -> Result<()> {
     } else {
         None
     };
-    let integrity = Integrity::new(key.as_deref(), created.as_second().try_into()?)?;
+    let integrity = Integrity::new(key.as_deref())?;
 
     let (db, version, source) =
         open_database(args.tzdata_bundled, args.tzdata_dir, args.cache_dir)?;
