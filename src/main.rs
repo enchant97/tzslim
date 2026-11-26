@@ -131,7 +131,7 @@ impl IntegrityTrailer {
         Signature {
             alg: "ed25519",
             val: Box::new(signer.key.sign(&msg).to_bytes()),
-            key: signer.key_id.clone(),
+            kid: signer.key_id.clone(),
             timestamp,
         }
     }
@@ -149,7 +149,7 @@ struct Signature<'a> {
     /// SHA-256 of the raw public key. Lets a device
     /// pick the right key from the ones it trusts (e.g. during key rotation)
     #[serde_as(as = "Base64")]
-    key: Box<[u8]>,
+    kid: Box<[u8]>,
     /// Creation time in Unix epoch seconds, shared by every file in one run.
     /// It is part of the signed message, so it cannot be altered; devices can
     /// use it to reject data older than what they already hold
