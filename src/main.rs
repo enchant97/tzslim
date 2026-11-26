@@ -28,81 +28,23 @@
 //! The ed25519 signature is made over the 32 raw bytes of the SHA-256 digest
 //! followed by `timestamp` as an 8-byte big-endian unsigned integer.
 
-use std::fs::{self, File};
-use std::io::{self, Cursor, Read};
-use std::path::{Path, PathBuf};
+mod acquisition;
+mod args;
+
+use std::fs;
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::{Signer as _, SigningKey};
-use jiff::{
-    Span, Timestamp,
-    tz::{TimeZone, TimeZoneDatabase},
-};
-use serde::{Deserialize, Serialize};
+use jiff::{Span, Timestamp, tz::TimeZone};
+use serde::Serialize;
 use serde_with::{base64::Base64, serde_as};
 use sha2::{Digest, Sha256};
 
-// --------------------------------------------------------------------------
-// CLI
-// --------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(version, about)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Generate an ed25519 keypair
-    Keygen,
-    /// Generate the static site
-    Build(BuildArgs),
-}
-
-#[derive(Args)]
-struct BuildArgs {
-    /// Output directory
-    #[arg(long, default_value = "dist/v1")]
-    out: PathBuf,
-
-    /// How many calendar years of future transitions to include
-    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=100))]
-    years: u16,
-
-    /// Sign every file with ed25519 (needs a signing key). Without it the
-    /// trailer carries the hash only and "sig" is null
-    #[arg(long)]
-    sign: bool,
-
-    /// Base64 ed25519 private key (32 bytes). Prefer the environment variable
-    /// or --signing-key-file so the key stays out of the process list.
-    #[arg(
-        long,
-        env = "TZ_SIGNING_KEY",
-        hide_env_values = true,
-        conflicts_with = "signing_key_file"
-    )]
-    signing_key: Option<String>,
-
-    /// File containing the base64 ed25519 private key (surrounding whitespace is ignored)
-    #[arg(long, env = "TZ_SIGNING_KEY_FILE")]
-    signing_key_file: Option<PathBuf>,
-
-    /// Use this directory of compiled TZif files instead of downloading
-    #[arg(long)]
-    tzdata_dir: Option<PathBuf>,
-
-    /// Use the database compiled into this binary (build with `--features tzdata-bundled`)
-    #[arg(long, conflicts_with = "tzdata_dir")]
-    tzdata_bundled: bool,
-
-    /// Where downloaded databases are cached
-    #[arg(long, default_value = ".tzdata-cache")]
-    cache_dir: PathBuf,
-}
+use crate::{
+    acquisition::open_database,
+    args::{BuildArgs, Cli, Command},
+};
 
 // --------------------------------------------------------------------------
 // Data model (serialised one JSON object per line)
@@ -171,21 +113,21 @@ struct IndexRow<'a> {
 /// signature over that hash.
 #[serde_as]
 #[derive(Serialize)]
-struct Trailer {
+struct Trailer<'a> {
     /// SHA-256 of every byte above this line, including the
     /// newline ending the last data line. Always present
     #[serde_as(as = "Base64")]
     hash: Box<[u8]>,
     /// ed25519 signature, or null when the build was not signed
-    sig: Option<Signature>,
+    sig: Option<Signature<'a>>,
 }
 
 /// Signature over `raw SHA-256 digest (32 bytes) || timestamp (8 bytes, big-endian)`.
 #[serde_as]
 #[derive(Serialize)]
-struct Signature {
+struct Signature<'a> {
     /// Algorithm, currently always "ed25519"
-    alg: &'static str,
+    alg: &'a str,
     /// Base64 signature
     val: String,
     /// SHA-256 of the raw public key. Lets a device
@@ -246,7 +188,7 @@ impl Integrity {
         Ok(Self { signer, created })
     }
 
-    fn trailer(&self, body: &[u8]) -> Trailer {
+    fn trailer(&self, body: &[u8]) -> Trailer<'_> {
         let digest = Sha256::digest(body);
         let sig = self.signer.as_ref().map(|s| {
             // Signed message: raw digest bytes, then the timestamp big-endian.
@@ -268,145 +210,11 @@ impl Integrity {
 
     /// Append the trailer as the final NDJSON line (always present).
     /// Returns the finished file bytes and the trailer that was written.
-    fn seal(&self, mut body: Vec<u8>) -> Result<(Vec<u8>, Trailer)> {
+    fn seal(&self, mut body: Vec<u8>) -> Result<(Vec<u8>, Trailer<'_>)> {
         let trailer = self.trailer(&body);
         push_line(&mut body, &trailer)?;
         Ok((body, trailer))
     }
-}
-
-// --------------------------------------------------------------------------
-// Database acquisition
-// --------------------------------------------------------------------------
-const PYPI_URL: &str = "https://pypi.org/pypi/tzdata/json";
-
-#[derive(Deserialize)]
-struct PypiMeta {
-    info: PypiInfo,
-    urls: Vec<PypiFile>,
-}
-#[derive(Deserialize)]
-struct PypiInfo {
-    version: String,
-}
-#[derive(Deserialize)]
-struct PypiFile {
-    filename: String,
-    url: String,
-    packagetype: String,
-    digests: PypiDigests,
-}
-#[derive(Deserialize)]
-struct PypiDigests {
-    sha256: String,
-}
-
-/// Return a directory of TZif files for the latest release, downloading it
-/// into `cache` if needed.
-fn ensure_database(cache: &Path) -> Result<PathBuf> {
-    let meta: PypiMeta = ureq::get(PYPI_URL)
-        .call()
-        .context("could not reach PyPI (use --tzdata-dir to work offline)")?
-        .into_body()
-        .read_json()?;
-    let file = meta
-        .urls
-        .iter()
-        .find(|f| f.packagetype == "bdist_wheel" && f.filename.ends_with(".whl"))
-        .context("no wheel published for the tzdata package")?;
-
-    let final_dir = cache.join(format!("tzdata-{}", meta.info.version));
-    let zoneinfo = final_dir.join("zoneinfo");
-    if zoneinfo.is_dir() {
-        eprintln!("using cached {}", final_dir.display());
-        return Ok(zoneinfo);
-    }
-
-    eprintln!("downloading {}", file.filename);
-    let mut wheel = Vec::new();
-    ureq::get(&file.url)
-        .call()?
-        .into_body()
-        .into_reader()
-        .read_to_end(&mut wheel)?;
-
-    let digest = hex::encode(Sha256::digest(&wheel));
-    if !digest.eq_ignore_ascii_case(&file.digests.sha256) {
-        bail!("SHA-256 mismatch for {}: got {digest}", file.filename);
-    }
-
-    let tmp = cache.join(format!(".partial-{}", meta.info.version));
-    if tmp.exists() {
-        fs::remove_dir_all(&tmp)?;
-    }
-    extract_zoneinfo(&wheel, &tmp)?;
-    fs::rename(&tmp, &final_dir)?;
-    Ok(zoneinfo)
-}
-
-/// Unpack `tzdata/zoneinfo/**` from the wheel into `<dest>/zoneinfo/**`.
-fn extract_zoneinfo(wheel: &[u8], dest: &Path) -> Result<()> {
-    let mut zip = zip::ZipArchive::new(Cursor::new(wheel))?;
-    for i in 0..zip.len() {
-        let mut entry = zip.by_index(i)?;
-        if entry.is_dir() {
-            continue;
-        }
-        // enclosed_name() rejects absolute paths and ".." traversal.
-        let Some(path) = entry.enclosed_name() else {
-            continue;
-        };
-        let Ok(rel) = path.strip_prefix("tzdata/zoneinfo") else {
-            continue;
-        };
-        let out = dest.join("zoneinfo").join(rel);
-        fs::create_dir_all(out.parent().unwrap())?;
-        io::copy(&mut entry, &mut File::create(&out)?)?;
-    }
-    Ok(())
-}
-
-/// Pick the database: bundled, a local directory, or the latest download.
-/// Returns the database, its IANA version and a description for messages.
-fn open_database(args: &BuildArgs) -> Result<(TimeZoneDatabase, String, String)> {
-    if args.tzdata_bundled {
-        let (db, version) = bundled_database()?;
-        return Ok((db, version, "the bundled database".into()));
-    }
-    let dir = match &args.tzdata_dir {
-        Some(d) => d.clone(),
-        None => ensure_database(&args.cache_dir)?,
-    };
-    let version = iana_version(&dir);
-    let db = TimeZoneDatabase::from_dir(&dir)
-        .with_context(|| format!("could not read zone files in {}", dir.display()))?;
-    Ok((db, version, dir.display().to_string()))
-}
-
-#[cfg(feature = "tzdata-bundled")]
-fn bundled_database() -> Result<(TimeZoneDatabase, String)> {
-    let version = jiff_tzdb::VERSION.unwrap_or("unknown").to_owned();
-    Ok((TimeZoneDatabase::bundled(), version))
-}
-
-#[cfg(not(feature = "tzdata-bundled"))]
-fn bundled_database() -> Result<(TimeZoneDatabase, String)> {
-    bail!(
-        "this binary has no bundled database; rebuild with `cargo build --release --features bundled`"
-    )
-}
-
-/// The first line of tzdata.zi looks like "# version 2026b".
-fn iana_version(dir: &Path) -> String {
-    fs::read_to_string(dir.join("tzdata.zi"))
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .next()
-                .and_then(|l| l.strip_prefix("# version "))
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".into())
 }
 
 // --------------------------------------------------------------------------
@@ -443,7 +251,8 @@ fn build(args: BuildArgs) -> Result<()> {
     };
     let integrity = Integrity::new(key.as_deref(), created.as_second().try_into()?)?;
 
-    let (db, version, source) = open_database(&args)?;
+    let (db, version, source) =
+        open_database(args.tzdata_bundled, args.tzdata_dir, args.cache_dir)?;
 
     // Transitions are listed from the creation time up to this many calendar years later.
     let end = created
@@ -526,7 +335,7 @@ fn build(args: BuildArgs) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    match Cli::get_cli().command {
         Command::Keygen => keygen(),
         Command::Build(args) => build(args),
     }
