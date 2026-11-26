@@ -128,8 +128,9 @@ struct Trailer<'a> {
 struct Signature<'a> {
     /// Algorithm, currently always "ed25519"
     alg: &'a str,
-    /// Base64 signature
-    val: String,
+    /// raw signature
+    #[serde_as(as = "Base64")]
+    val: Box<[u8]>,
     /// SHA-256 of the raw public key. Lets a device
     /// pick the right key from the ones it trusts (e.g. during key rotation)
     #[serde_as(as = "Base64")]
@@ -197,7 +198,7 @@ impl Integrity {
             msg.extend_from_slice(&self.created.to_be_bytes());
             Signature {
                 alg: "ed25519",
-                val: B64.encode(s.key.sign(&msg).to_bytes()),
+                val: Box::new(s.key.sign(&msg).to_bytes()),
                 key: s.key_id.clone(),
                 timestamp: self.created,
             }
