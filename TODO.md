@@ -1,6 +1,6 @@
 # TODO
 ## Minor
-- Replace hex output of hash with base64 (should be smaller output and aligns with signature output)
+- Can padding be disabled in base64? (maintain compatibility with common decoders)
 - Move signature out of hash line and into separate lines (allow for multiple signatures)
 - Split the code into separate modules
 - Check comments make sense

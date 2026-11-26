@@ -14,7 +14,7 @@
 //! {"v":"2026b","n":"Europe/London","a":"GMT","o":0,"u":1924991999}
 //! {"t":1774832400,"o":3600,"a":"BST"}
 //! {"t":1792976400,"o":0,"a":"GMT"}
-//! {"hash":"<sha256 hex of every byte above>","sig":null}
+//! {"hash":"<base64 sha256 of every byte above>","sig":null}
 //! ```
 //!
 //! The trailer is always the LAST line. `hash` covers every byte before it,
@@ -22,7 +22,7 @@
 //! filled in instead of null:
 //!
 //! ```text
-//! {"hash":"...","sig":{"alg":"ed25519","val":"<base64>","key":"<sha256 hex of public key>","timestamp":1767225600}}
+//! {"hash":"...","sig":{"alg":"ed25519","val":"<base64>","key":"<base64 sha256 of public key>","timestamp":1767225600}}
 //! ```
 //!
 //! The ed25519 signature is made over the 32 raw bytes of the SHA-256 digest
@@ -41,6 +41,7 @@ use jiff::{
     tz::{TimeZone, TimeZoneDatabase},
 };
 use serde::{Deserialize, Serialize};
+use serde_with::{base64::Base64, serde_as};
 use sha2::{Digest, Sha256};
 
 // --------------------------------------------------------------------------
@@ -156,35 +157,41 @@ struct IndexHeader<'a> {
     generated: i64,
 }
 
+#[serde_as]
 #[derive(Serialize)]
 struct IndexRow<'a> {
     /// Zone name
     n: &'a str,
-    /// First 16 hex chars of the SHA-256 of the zone body
-    h: String,
+    #[serde_as(as = "Base64")]
+    /// SHA-256 of the zone body
+    h: Box<[u8]>,
 }
 
 /// Final line of every file: a hash of everything above it, plus an optional
 /// signature over that hash.
+#[serde_as]
 #[derive(Serialize)]
 struct Trailer {
-    /// Lowercase hex SHA-256 of every byte above this line, including the
+    /// SHA-256 of every byte above this line, including the
     /// newline ending the last data line. Always present
-    hash: String,
+    #[serde_as(as = "Base64")]
+    hash: Box<[u8]>,
     /// ed25519 signature, or null when the build was not signed
     sig: Option<Signature>,
 }
 
 /// Signature over `raw SHA-256 digest (32 bytes) || timestamp (8 bytes, big-endian)`.
+#[serde_as]
 #[derive(Serialize)]
 struct Signature {
     /// Algorithm, currently always "ed25519"
     alg: &'static str,
     /// Base64 signature
     val: String,
-    /// Lowercase hex SHA-256 of the raw 32-byte public key. Lets a device
+    /// SHA-256 of the raw public key. Lets a device
     /// pick the right key from the ones it trusts (e.g. during key rotation)
-    key: String,
+    #[serde_as(as = "Base64")]
+    key: Box<[u8]>,
     /// Creation time in Unix epoch seconds, shared by every file in one run.
     /// It is part of the signed message, so it cannot be altered; devices can
     /// use it to reject data older than what they already hold
@@ -200,16 +207,16 @@ fn push_line<T: Serialize>(buf: &mut Vec<u8>, value: &T) -> Result<()> {
 // --------------------------------------------------------------------------
 // Integrity / signing
 // --------------------------------------------------------------------------
-/// Lowercase hex SHA-256 of a raw public key, used as the key id in signatures.
-fn key_id(public_key: &[u8; 32]) -> String {
-    hex::encode(Sha256::digest(public_key))
+/// SHA-256 of a raw public key, used as the key id in signatures.
+fn key_id(public_key: &[u8; 32]) -> Box<[u8]> {
+    Sha256::digest(public_key).to_vec().into_boxed_slice()
 }
 
 /// An ed25519 signing key together with its id.
 struct Signer {
     key: SigningKey,
-    /// Lowercase hex SHA-256 of the public key
-    key_id: String,
+    /// SHA-256 of the public key
+    key_id: Box<[u8]>,
 }
 
 /// Produces the trailer line. It always hashes the body and signs it only
@@ -254,7 +261,7 @@ impl Integrity {
             }
         });
         Trailer {
-            hash: hex::encode(digest),
+            hash: digest.to_vec().into_boxed_slice(),
             sig,
         }
     }
@@ -415,7 +422,7 @@ fn keygen() -> Result<()> {
     let public = key.verifying_key().to_bytes();
     println!("{}", B64.encode(public));
     println!("Key id (SHA-256 of the public key, appears as \"key\" in signatures):");
-    println!("{}", key_id(&public));
+    println!("{}", B64.encode(key_id(&public)));
     Ok(())
 }
 
@@ -494,7 +501,7 @@ fn build(args: BuildArgs) -> Result<()> {
         let path = args.out.join(format!("{name}.ndjson"));
         fs::create_dir_all(path.parent().unwrap())?;
         fs::write(&path, file)?;
-        index.push((name.as_str(), trailer.hash[..16].to_owned()));
+        index.push((name.as_str(), trailer.hash));
     }
 
     let mut body = Vec::new();
